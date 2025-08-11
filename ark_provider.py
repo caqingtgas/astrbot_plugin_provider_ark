@@ -3,7 +3,7 @@ import aiohttp
 from typing import List, Dict, Tuple, Optional
 from types import SimpleNamespace
 
-from astrbot.api import logger  # 按官方要求导入 logger
+from astrbot.api import logger  # 规范的日志导入
 from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
 
@@ -138,7 +138,7 @@ class ArkContextProvider(Provider):
         except Exception:
             pass
 
-        # 记录到实例属性，便于后续指令查询（不影响现有逻辑）
+        # 记录到实例属性，便于后续指令查询
         if not hasattr(self, "_last_usage"):
             self._last_usage: Dict[str, dict] = {}
         self._last_usage[skey] = usage
@@ -156,7 +156,7 @@ class ArkContextProvider(Provider):
         # 最稳返回：completion_text 路径
         resp = LLMResponse(role="assistant", completion_text=text)
 
-        # usage 回填（供统计插件读取）—— 使用 SimpleNamespace 提升可读性
+        # usage 回填（使用 SimpleNamespace 提升可读性）
         raw = SimpleNamespace()
         raw.usage = SimpleNamespace()
         raw.usage.prompt_tokens = int(usage.get("prompt_tokens", 0))
