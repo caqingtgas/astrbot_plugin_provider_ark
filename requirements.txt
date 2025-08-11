@@ -1,0 +1,3 @@
+aiohttp
+faiss-cpu
+pymilvus>=2.5.0
