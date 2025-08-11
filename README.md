@@ -12,7 +12,7 @@ ChatGPT5.0全新力作，之前用GPT4.5和Gemini2.5Pro都没能解决。
 - 消耗token统计：控制台中输出token消耗情况， `cached_tokens` 为命中缓存数
 
 ## 如何使用
-1. 去https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint创建对应模型的接入点，得到形如ep-xxxx-xxxx的ID
+1. 去 [这里](https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint) 创建对应模型的接入点，得到形如ep-xxxx-xxxx的ID
 2. 在配置文件中添加供应商：
    ```json
     {
