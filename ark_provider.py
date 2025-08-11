@@ -1,8 +1,9 @@
 # /opt/AstrBot/data/plugins/astrbot_provider_ark/ark_provider.py
 import aiohttp
 from typing import List, Dict, Tuple, Optional
+from types import SimpleNamespace
 
-from astrbot.core import logger
+from astrbot.api import logger  # 按官方要求导入 logger
 from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
 
@@ -11,9 +12,6 @@ try:
     from astrbot.core.provider.entities import LLMResponse, ProviderType
 except Exception:  # pragma: no cover
     from astrbot.core.provider.entites import LLMResponse, ProviderType  # type: ignore
-
-LAST_USAGE: Dict[str, dict] = {}   # 每个 skey(会话) -> 最近一次 usage
-LAST_RECENT: Tuple[str, dict] | None = None  # 最近一次 (skey, usage)
 
 
 @register_provider_adapter(
@@ -158,34 +156,43 @@ class ArkContextProvider(Provider):
         # 最稳返回：completion_text 路径
         resp = LLMResponse(role="assistant", completion_text=text)
 
-        # usage 回填（供统计插件读取）
-        class _U: ...
-        class _R: ...
-        raw = _R(); raw.usage = _U()
+        # usage 回填（供统计插件读取）—— 使用 SimpleNamespace 提升可读性
+        raw = SimpleNamespace()
+        raw.usage = SimpleNamespace()
         raw.usage.prompt_tokens = int(usage.get("prompt_tokens", 0))
         raw.usage.completion_tokens = int(usage.get("completion_tokens", 0))
-        raw.usage.total_tokens = int(usage.get("total_tokens", raw.usage.prompt_tokens + raw.usage.completion_tokens))
+        raw.usage.total_tokens = int(
+            usage.get("total_tokens", raw.usage.prompt_tokens + raw.usage.completion_tokens)
+        )
         resp.raw_completion = raw
 
         # 透传更多细节，便于外部读取（含缓存命中数）
         try:
-            resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
-        except Exception:
-            pass
+            resp.extra = {
+                "ark_usage": usage,
+                "ark_cached_tokens": cached_tokens,
+                "ark_context_id": ctx_id,
+            }
+        except AttributeError as e:
+            logger.warning(f"[ArkProvider] 设置响应 extra 属性时出错: {e}")
+        except Exception as e:
+            logger.warning(f"[ArkProvider] 设置响应 extra 属性时发生未知错误: {e}")
 
         # 兼容字段
         for attr in ("text", "answer", "plain_text", "content", "message"):
             try:
                 setattr(resp, attr, text)
-            except Exception:
-                pass
+            except AttributeError as e:
+                logger.warning(f"[ArkProvider] 设置响应 {attr} 属性时出错: {e}")
+            except Exception as e:
+                logger.warning(f"[ArkProvider] 设置响应 {attr} 属性时发生未知错误: {e}")
 
         return resp
 
-
-    async def __del__(self):
+    async def close(self):
+        """显式资源释放；可在插件生命周期里调用"""
         try:
             if self._session and not self._session.closed:
                 await self._session.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[ArkProvider] 关闭 HTTP 会话时出错: {e}")
