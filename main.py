@@ -1,9 +1,9 @@
-# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/main.py
 from astrbot.api.star import Star, Context
 from astrbot.api import logger
 
-# 确保 ark_provider.py 被导入，从而完成 Provider 的注册（副作用）
+# 导入 provider 模块以触发其内部的 register_provider_adapter 装饰器完成注册
 from . import ark_provider  # noqa: F401
+
 
 class ArkProviderLoader(Star):
     def __init__(self, context: Context):
