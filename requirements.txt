@@ -1,3 +1,2 @@
-aiohttp
-faiss-cpu
-pymilvus>=2.5.0
+# 仅当运行环境无 aiohttp 时需要
+aiohttp>=3.9.0

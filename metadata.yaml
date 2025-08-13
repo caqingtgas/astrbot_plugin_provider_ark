@@ -1,6 +1,6 @@
 name: astrbot_plugin_provider_ark
 desc: 将可应用上下文缓存API的火山方舟(Volcengine Ark) 注册为 AstrBot 的对话服务提供商(Provider)(支持 /provider 切换)
-version: 1.0.0
+version: 1.0.1
 author: CaQing ＆ GPT-5
 repo: https://github.com/caqingtgas/astrbot_plugin_provider_ark
 

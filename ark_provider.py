@@ -1,5 +1,7 @@
 # /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/ark_provider.py
 import aiohttp
+import json
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from types import SimpleNamespace
 
@@ -10,7 +12,7 @@ from astrbot.core.provider.register import register_provider_adapter
 # 兼容新旧路径
 try:
     from astrbot.core.provider.entities import LLMResponse, ProviderType
-except Exception:  # pragma: no cover
+except ImportError:  # 更具体
     from astrbot.core.provider.entites import LLMResponse, ProviderType  # type: ignore
 
 
@@ -29,16 +31,26 @@ class ArkContextProvider(Provider):
 
     def __init__(self, provider_config: dict, provider_settings: dict, default_persona=None):
         super().__init__(provider_config, provider_settings, default_persona)
+
+        # ---- 基础配置 ----
         self._keys: List[str] = [(k or "").strip() for k in provider_config.get("key", []) if (k or "").strip()]
         self._key_idx: int = 0
         self._base: str = (provider_config.get("api_base") or "https://ark.cn-beijing.volces.com/api/v3").strip().rstrip("/")
         self._model_default: str = (provider_config.get("model") or provider_config.get("model_config", {}).get("model") or "").strip()
         self._ttl: int = int(provider_config.get("ttl", 86400))
+
+        # ---- 状态 ----
         self._session: Optional[aiohttp.ClientSession] = None
-        self._ctx_map: Dict[str, str] = {}  # AstrBot session_id -> Ark context_id
+        self._last_usage: Dict[str, dict] = {}          # 显式在 __init__ 初始化
+        self._ctx_map: Dict[str, str] = {}              # AstrBot session_id -> Ark context_id
+
+        # ---- 持久化（默认开启，可在 provider 配置中用 persist_ctx=False 关闭）----
+        self._persist_ctx: bool = bool(provider_config.get("persist_ctx", True))
+        self._ctx_file: Path = Path(__file__).resolve().parent / "data" / "ctx_map.json"
+        self._load_ctx_map()  # 尝试加载历史映射
 
         masked = (self._keys[0][:6] + "..." + self._keys[0][-4:]) if self._keys else "EMPTY"
-        logger.info(f"[ArkProvider] init base={self._base}, model={self._model_default}, key={masked}")
+        logger.info(f"[ArkProvider] init base={self._base}, model={self._model_default}, key={masked}, persist_ctx={self._persist_ctx}")
 
     # ===== Provider 基础能力 =====
     def get_models(self) -> List[str]:
@@ -119,28 +131,42 @@ class ArkContextProvider(Provider):
         if not contexts and skey in self._ctx_map:
             dropped = self._ctx_map.pop(skey, None)
             logger.info(f"[ArkProvider] reset detected -> drop ctx={dropped} skey={skey}")
+            self._save_ctx_map()
 
         # 命中/创建 Ark 上下文
         ctx_id = self._ctx_map.get(skey)
         if not ctx_id:
             ctx_id = await self._context_create(model_name, system_prompt or "")
             self._ctx_map[skey] = ctx_id
+            self._save_ctx_map()
             logger.info(f"[ArkProvider] create ctx={ctx_id} skey={skey}")
 
-        # 请求 Ark
-        content, usage = await self._context_chat(model_name, ctx_id, prompt)
+        # 请求 Ark（若 ctx 失效/过期，则自动重建并重试一次）
+        try:
+            content, usage = await self._context_chat(model_name, ctx_id, prompt)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "context" in msg and any(k in msg for k in ("invalid", "expire", "not found", "does not exist")):
+                logger.warning(f"[ArkProvider] ctx invalid -> recreate & retry. old={ctx_id}, skey={skey}")
+                ctx_id = await self._context_create(model_name, system_prompt or "")
+                self._ctx_map[skey] = ctx_id
+                self._save_ctx_map()
+                content, usage = await self._context_chat(model_name, ctx_id, prompt)
+            else:
+                raise
+
         text = str(content)
 
         # —— 统计 & 记录缓存命中数（prompt_tokens_details.cached_tokens）——
         cached_tokens = 0
-        try:
-            cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0))
-        except Exception:
-            pass
+        ptd = usage.get("prompt_tokens_details")
+        if isinstance(ptd, dict):
+            try:
+                cached_tokens = int(ptd.get("cached_tokens", 0))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"[ArkProvider] cached_tokens parse error: {e}")
 
-        # 记录到实例属性，便于后续指令查询
-        if not hasattr(self, "_last_usage"):
-            self._last_usage: Dict[str, dict] = {}
+        # 记录最近 usage
         self._last_usage[skey] = usage
         self._last_recent: Tuple[str, dict] = (skey, usage)
 
@@ -175,8 +201,6 @@ class ArkContextProvider(Provider):
             }
         except AttributeError as e:
             logger.warning(f"[ArkProvider] 设置响应 extra 属性时出错: {e}")
-        except Exception as e:
-            logger.warning(f"[ArkProvider] 设置响应 extra 属性时发生未知错误: {e}")
 
         # 兼容字段
         for attr in ("text", "answer", "plain_text", "content", "message"):
@@ -184,8 +208,6 @@ class ArkContextProvider(Provider):
                 setattr(resp, attr, text)
             except AttributeError as e:
                 logger.warning(f"[ArkProvider] 设置响应 {attr} 属性时出错: {e}")
-            except Exception as e:
-                logger.warning(f"[ArkProvider] 设置响应 {attr} 属性时发生未知错误: {e}")
 
         return resp
 
@@ -196,3 +218,30 @@ class ArkContextProvider(Provider):
                 await self._session.close()
         except Exception as e:
             logger.warning(f"[ArkProvider] 关闭 HTTP 会话时出错: {e}")
+
+    # ===== 本地持久化：ctx_map =====
+    def _load_ctx_map(self):
+        if not self._persist_ctx:
+            return
+        p = self._ctx_file
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                m = data.get("map", {})
+                if isinstance(m, dict):
+                    self._ctx_map = {str(k): str(v) for k, v in m.items()}
+                    logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
+        except Exception as e:
+            logger.warning(f"[ArkProvider] failed to load ctx_map: {e}")
+
+    def _save_ctx_map(self):
+        if not self._persist_ctx:
+            return
+        p = self._ctx_file
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"map": self._ctx_map}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+        except Exception as e:
+            logger.warning(f"[ArkProvider] failed to save ctx_map: {e}")
