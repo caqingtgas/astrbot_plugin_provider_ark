@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from types import SimpleNamespace
 
-from astrbot.api import logger  # 规范的日志导入
-from astrbot.api.star import StarTools  # 用统一数据目录
+from astrbot.api import logger
+from astrbot.api.star import StarTools
 from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
-from astrbot.core.provider.entities import LLMResponse, ProviderType  # 仅使用标准模块名
+from astrbot.core.provider.entities import LLMResponse, ProviderType
+
 
 @register_provider_adapter(
     "ark_context",
@@ -34,6 +35,7 @@ class ArkContextProvider(Provider):
         self._base: str = (provider_config.get("api_base") or "https://ark.cn-beijing.volces.com/api/v3").strip().rstrip("/")
         self._model_default: str = (provider_config.get("model") or provider_config.get("model_config", {}).get("model") or "").strip()
         self._ttl: int = int(provider_config.get("ttl", 86400))
+        self._timeout: int = int(provider_config.get("timeout", 60))  # 可配置
 
         # ---- 状态 ----
         self._session: Optional[aiohttp.ClientSession] = None
@@ -45,12 +47,12 @@ class ArkContextProvider(Provider):
         data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark")
         self._ctx_file: Path = Path(data_dir) / "ctx_map.json"
         self._ctx_lock = asyncio.Lock()
-        self._load_ctx_map()
+        self._ctx_loaded: bool = False  # 懒加载标记（不在 __init__ 里读盘）
 
         masked = (self._keys[0][:6] + "..." + self._keys[0][-4:]) if self._keys else "EMPTY"
         logger.info(
-            "[ArkProvider] init base=%s, model=%s, key=%s, persist_ctx=%s, ctx_path=%s",
-            self._base, self._model_default, masked, self._persist_ctx, self._ctx_file
+            "[ArkProvider] init base=%s, model=%s, key=%s, persist_ctx=%s, ctx_path=%s, timeout=%s",
+            self._base, self._model_default, masked, self._persist_ctx, self._ctx_file, self._timeout
         )
 
     # ===== Provider 基础能力 =====
@@ -69,7 +71,7 @@ class ArkContextProvider(Provider):
     # ===== Ark HTTP =====
     async def _sess(self) -> aiohttp.ClientSession:
         if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout))
         return self._session
 
     def _headers(self) -> dict:
@@ -108,6 +110,119 @@ class ArkContextProvider(Provider):
                 return content, usage
             raise RuntimeError(f"Ark context_chat failed: {data}")
 
+    # ===== 私有辅助：懒加载 ctx_map =====
+    async def _ensure_ctx_loaded(self):
+        if self._ctx_loaded or not self._persist_ctx:
+            self._ctx_loaded = True
+            return
+        p = self._ctx_file
+
+        def _read_sync() -> Dict[str, str]:
+            if not p.exists():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            m = data.get("map", {})
+            return {str(k): str(v) for k, v in m.items()} if isinstance(m, dict) else {}
+
+        try:
+            self._ctx_map = await asyncio.to_thread(_read_sync)
+            if self._ctx_map:
+                logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("[ArkProvider] failed to load ctx_map from %s: %s", p, e)
+        finally:
+            self._ctx_loaded = True
+
+    # ===== 私有辅助：保存 ctx_map（互斥 + 原子写 + 异步线程）=====
+    async def _save_ctx_map(self):
+        if not self._persist_ctx:
+            return
+        p = self._ctx_file
+
+        def _write_sync():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"map": self._ctx_map}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+
+        async with self._ctx_lock:
+            try:
+                await asyncio.to_thread(_write_sync)
+            except (OSError, PermissionError) as e:
+                logger.warning("[ArkProvider] failed to save ctx_map to %s: %s", p, e)
+
+    # ===== 私有辅助：获取或创建 context =====
+    async def _get_or_create_context(
+        self, skey: str, model_name: str, system_prompt: str, contexts: Optional[List[dict]]
+    ) -> str:
+        # /reset 配合：AstrBot 清空历史后（contexts 为空），丢弃旧 ctx 强制重建
+        if not contexts and skey in self._ctx_map:
+            dropped = self._ctx_map.pop(skey, None)
+            logger.info("[ArkProvider] reset detected -> drop ctx=%s skey=%s", dropped, skey)
+            await self._save_ctx_map()
+
+        ctx_id = self._ctx_map.get(skey)
+        if not ctx_id:
+            ctx_id = await self._context_create(model_name, system_prompt or "")
+            self._ctx_map[skey] = ctx_id
+            await self._save_ctx_map()
+            logger.info("[ArkProvider] create ctx=%s skey=%s", ctx_id, skey)
+        return ctx_id
+
+    # ===== 私有辅助：聊天并按需重试 =====
+    async def _perform_chat_with_retry(
+        self, model_name: str, ctx_id: str, prompt: str, system_prompt: str, skey: str
+    ) -> Tuple[str, dict, str]:
+        try:
+            content, usage = await self._context_chat(model_name, ctx_id, prompt)
+            return content, usage, ctx_id
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "context" in msg and any(k in msg for k in ("invalid", "expire", "not found", "does not exist")):
+                logger.warning("[ArkProvider] ctx invalid -> recreate & retry. old=%s skey=%s", ctx_id, skey)
+                new_ctx = await self._context_create(model_name, system_prompt or "")
+                self._ctx_map[skey] = new_ctx
+                await self._save_ctx_map()
+                content, usage = await self._context_chat(model_name, new_ctx, prompt)
+                return content, usage, new_ctx
+            raise
+
+    # ===== 私有辅助：构建 LLMResponse =====
+    def _build_llm_response(self, text: str, usage: dict, ctx_id: str) -> LLMResponse:
+        resp = LLMResponse(role="assistant", completion_text=str(text))
+
+        # usage 回填（更健壮的 total_tokens）
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+        total_tokens = usage.get("total_tokens")
+        try:
+            total = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
+        except (ValueError, TypeError):
+            logger.warning("[ArkProvider] 无法将 total_tokens ('%s') 转为整数，回退为计算值", total_tokens)
+            total = prompt_tokens + completion_tokens
+
+        raw = SimpleNamespace()
+        raw.usage = SimpleNamespace()
+        raw.usage.prompt_tokens = prompt_tokens
+        raw.usage.completion_tokens = completion_tokens
+        raw.usage.total_tokens = total
+        resp.raw_completion = raw
+
+        # extra（含缓存命中）
+        cached_tokens = 0
+        ptd = usage.get("prompt_tokens_details")
+        if isinstance(ptd, dict):
+            try:
+                cached_tokens = int(ptd.get("cached_tokens", 0))
+            except (TypeError, ValueError) as e:
+                logger.warning("[ArkProvider] cached_tokens parse error: %s", e)
+        try:
+            resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
+        except AttributeError as e:
+            logger.warning("[ArkProvider] 设置响应 extra 属性时出错: %s", e)
+
+        return resp
+
     # ===== AstrBot Provider 入口 =====
     async def text_chat(
         self,
@@ -121,44 +236,27 @@ class ArkContextProvider(Provider):
         model: str | None = None,
         **kwargs,
     ) -> LLMResponse:
+        await self._ensure_ctx_loaded()
+
         model_name = (model or self.get_model() or self._model_default).strip()
         if not model_name:
             raise RuntimeError("ArkProvider: model not configured (use ep-... endpoint id)")
         if not self.get_current_key():
             raise RuntimeError("ArkProvider: API Key not configured")
 
-        # /reset 配合：AstrBot 清空历史后（contexts 为空），丢弃旧 ctx 强制重建
         skey = (session_id or "global").strip()
-        if not contexts and skey in self._ctx_map:
-            dropped = self._ctx_map.pop(skey, None)
-            logger.info("[ArkProvider] reset detected -> drop ctx=%s skey=%s", dropped, skey)
-            await self._save_ctx_map()
+        ctx_id = await self._get_or_create_context(skey, model_name, system_prompt or "", contexts)
 
-        # 命中/创建 Ark 上下文
-        ctx_id = self._ctx_map.get(skey)
-        if not ctx_id:
-            ctx_id = await self._context_create(model_name, system_prompt or "")
-            self._ctx_map[skey] = ctx_id
-            await self._save_ctx_map()
-            logger.info("[ArkProvider] create ctx=%s skey=%s", ctx_id, skey)
-
-        # 请求 Ark（若 ctx 失效/过期，则自动重建并重试一次）
-        try:
-            content, usage = await self._context_chat(model_name, ctx_id, prompt)
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "context" in msg and any(k in msg for k in ("invalid", "expire", "not found", "does not exist")):
-                logger.warning("[ArkProvider] ctx invalid -> recreate & retry. old=%s skey=%s", ctx_id, skey)
-                ctx_id = await self._context_create(model_name, system_prompt or "")
-                self._ctx_map[skey] = ctx_id
-                await self._save_ctx_map()
-                content, usage = await self._context_chat(model_name, ctx_id, prompt)
-            else:
-                raise
-
+        content, usage, ctx_id = await self._perform_chat_with_retry(
+            model_name, ctx_id, prompt, system_prompt or "", skey
+        )
         text = str(content)
 
-        # —— 记录缓存命中数（prompt_tokens_details.cached_tokens）——
+        # 记录最近 usage
+        self._last_usage[skey] = usage
+        self._last_recent: Tuple[str, dict] = (skey, usage)
+
+        # usage 概览日志（含缓存命中）
         cached_tokens = 0
         ptd = usage.get("prompt_tokens_details")
         if isinstance(ptd, dict):
@@ -166,11 +264,6 @@ class ArkContextProvider(Provider):
                 cached_tokens = int(ptd.get("cached_tokens", 0))
             except (TypeError, ValueError) as e:
                 logger.warning("[ArkProvider] cached_tokens parse error: %s", e)
-
-        # 记录最近 usage
-        self._last_usage[skey] = usage
-        self._last_recent: Tuple[str, dict] = (skey, usage)
-
         logger.info(
             "[ArkProvider] usage: prompt=%s completion=%s total=%s cached_tokens=%s",
             usage.get("prompt_tokens", 0),
@@ -179,26 +272,7 @@ class ArkContextProvider(Provider):
             cached_tokens,
         )
 
-        resp = LLMResponse(role="assistant", completion_text=text)
-
-        # usage 回填（拆分写法更直观）
-        raw = SimpleNamespace()
-        raw.usage = SimpleNamespace()
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
-        total_tokens = usage.get("total_tokens")
-        raw.usage.prompt_tokens = prompt_tokens
-        raw.usage.completion_tokens = completion_tokens
-        raw.usage.total_tokens = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
-        resp.raw_completion = raw
-
-        # 透传更多细节（含缓存命中数）
-        try:
-            resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
-        except AttributeError as e:
-            logger.warning("[ArkProvider] 设置响应 extra 属性时出错: %s", e)
-
-        return resp
+        return self._build_llm_response(text, usage, ctx_id)
 
     async def close(self):
         try:
@@ -206,31 +280,3 @@ class ArkContextProvider(Provider):
                 await self._session.close()
         except Exception as e:
             logger.warning("[ArkProvider] 关闭 HTTP 会话时出错: %s", e)
-
-    # ===== 本地持久化：ctx_map =====
-    def _load_ctx_map(self):
-        if not self._persist_ctx:
-            return
-        p = self._ctx_file
-        try:
-            if p.exists():
-                data = json.loads(p.read_text(encoding="utf-8"))
-                m = data.get("map", {})
-                if isinstance(m, dict):
-                    self._ctx_map = {str(k): str(v) for k, v in m.items()}
-                    logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("[ArkProvider] failed to load ctx_map from %s: %s", p, e)
-
-    async def _save_ctx_map(self):
-        if not self._persist_ctx:
-            return
-        p = self._ctx_file
-        async with self._ctx_lock:
-            try:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                tmp = p.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"map": self._ctx_map}, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp.replace(p)
-            except (OSError, PermissionError) as e:
-                logger.warning("[ArkProvider] failed to save ctx_map to %s: %s", p, e)
