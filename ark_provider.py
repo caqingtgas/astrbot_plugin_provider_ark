@@ -27,6 +27,14 @@ class ArkContextProvider(Provider):
     """
 
     def __init__(self, provider_config: dict, provider_settings: dict, default_persona=None):
+        """
+        初始化 Provider。
+
+        Args:
+            provider_config: AstrBot 中为该 Provider 配置的字典（key、api_base、ttl、timeout、persist_ctx 等）。
+            provider_settings: 由框架注入的运行时设置。
+            default_persona: 默认人格（未使用）。
+        """
         super().__init__(provider_config, provider_settings, default_persona)
 
         # ---- 基础配置 ----
@@ -45,8 +53,12 @@ class ArkContextProvider(Provider):
         self._persist_ctx: bool = bool(provider_config.get("persist_ctx", True))
         data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark")
         self._ctx_file: Path = Path(data_dir) / "ctx_map.json"
-        self._ctx_lock = asyncio.Lock()
-        self._ctx_loaded: bool = False  # 懒加载标记（不在 __init__ 里读盘）
+        self._ctx_lock = asyncio.Lock()          # I/O 与懒加载互斥
+        self._ctx_loaded: bool = False           # 懒加载标记（不在 __init__ 里读盘）
+
+        # ---- 逐键互斥锁（为 skey 的 context 创建提供互斥，解决并发竞态）----
+        self._ctx_locks: Dict[str, asyncio.Lock] = {}
+        self._ctx_locks_lock = asyncio.Lock()    # 保护 _ctx_locks 字典自身
 
         masked = (self._keys[0][:6] + "..." + self._keys[0][-4:]) if self._keys else "EMPTY"
         logger.info(
@@ -56,27 +68,43 @@ class ArkContextProvider(Provider):
 
     # ===== Provider 基础能力 =====
     def get_models(self) -> List[str]:
+        """
+        返回可用模型列表（来自 provider_config.models 或默认单模型）。
+        """
         models = self.provider_config.get("models")
         return models if isinstance(models, list) and models else ([self._model_default] if self._model_default else [])
 
     def get_current_key(self) -> str:
+        """
+        获取当前使用的 API Key（支持多 Key 轮换选择）。
+        """
         return self._keys[self._key_idx] if self._keys else ""
 
     def set_key(self, key: str):
+        """
+        设置当前使用的 API Key。
+        """
         k = (key or "").strip()
         if k in self._keys:
             self._key_idx = self._keys.index(k)
 
     # ===== Ark HTTP =====
     async def _sess(self) -> aiohttp.ClientSession:
+        """
+        获取（或创建）共享的 aiohttp.ClientSession，会使用可配置的总超时。
+        """
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout))
         return self._session
 
     def _headers(self) -> dict:
+        """构造 Ark API 所需请求头。"""
         return {"Authorization": f"Bearer {self.get_current_key().strip()}", "Content-Type": "application/json"}
 
     async def _context_create(self, model: str, system_prompt: str) -> str:
+        """
+        创建 Ark 对话上下文（Context）。
+        """
         url = f"{self._base}/context/create"
         payload = {
             "model": model,
@@ -93,6 +121,9 @@ class ArkContextProvider(Provider):
             raise RuntimeError(f"Ark context_create failed: {data}")
 
     async def _context_chat(self, model: str, ctx_id: str, user_text: str) -> Tuple[str, dict]:
+        """
+        使用既有 context 进行一次非流式对话请求。
+        """
         url = f"{self._base}/context/chat/completions"
         payload = {
             "model": model,
@@ -109,12 +140,16 @@ class ArkContextProvider(Provider):
                 return content, usage
             raise RuntimeError(f"Ark context_chat failed: {data}")
 
-    # ===== 私有辅助：懒加载 ctx_map（加锁 + 二次检查）=====
+    # ===== 懒加载：读取 ctx_map（加锁 + 二次检查）=====
     async def _ensure_ctx_loaded(self):
+        """
+        懒加载上下文映射表：在首次使用前从磁盘加载到内存。
+        加锁并二次检查，避免并发重复加载；I/O 在线程池中执行，避免阻塞事件循环。
+        """
         if self._ctx_loaded or not self._persist_ctx:
             return
         async with self._ctx_lock:
-            if self._ctx_loaded:  # 二次检查，避免并发重复加载
+            if self._ctx_loaded:  # 二次检查
                 return
             p = self._ctx_file
 
@@ -134,8 +169,12 @@ class ArkContextProvider(Provider):
             finally:
                 self._ctx_loaded = True
 
-    # ===== 私有辅助：保存 ctx_map（互斥 + 原子写 + 异步线程）=====
+    # ===== 保存 ctx_map（互斥 + 原子写 + 异步线程）=====
     async def _save_ctx_map(self):
+        """
+        将内存中的上下文映射表保存到磁盘。
+        使用互斥锁与原子替换，I/O 在线程池执行。
+        """
         if not self._persist_ctx:
             return
         p = self._ctx_file
@@ -152,28 +191,49 @@ class ArkContextProvider(Provider):
             except (OSError, PermissionError) as e:
                 logger.warning("[ArkProvider] failed to save ctx_map to %s: %s", p, e)
 
-    # ===== 私有辅助：获取或创建 context =====
+    # ===== 逐键互斥：获取某个 skey 的锁 =====
+    async def _get_key_lock(self, skey: str) -> asyncio.Lock:
+        """
+        返回该 skey 对应的互斥锁；必要时在受保护字典内创建。
+        """
+        async with self._ctx_locks_lock:
+            lock = self._ctx_locks.get(skey)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._ctx_locks[skey] = lock
+            return lock
+
+    # ===== 获取或创建 context（逐键加锁，避免并发竞态）=====
     async def _get_or_create_context(
         self, skey: str, model_name: str, system_prompt: str, contexts: Optional[List[dict]]
     ) -> str:
-        # /reset 配合：AstrBot 清空历史后（contexts 为空），丢弃旧 ctx 强制重建
-        if not contexts and skey in self._ctx_map:
-            dropped = self._ctx_map.pop(skey, None)
-            logger.info("[ArkProvider] reset detected -> drop ctx=%s skey=%s", dropped, skey)
-            await self._save_ctx_map()
+        """
+        获取（或在必要时创建）给定 skey 的 Ark context。
+        将“检查是否存在 + 创建 + 写入映射”作为一个临界区，在 per-skey 互斥锁下执行，避免并发重复创建。
+        """
+        key_lock = await self._get_key_lock(skey)
+        async with key_lock:
+            # /reset 配合：AstrBot 清空历史后（contexts 为空），丢弃旧 ctx 强制重建
+            if not contexts and skey in self._ctx_map:
+                dropped = self._ctx_map.pop(skey, None)
+                logger.info("[ArkProvider] reset detected -> drop ctx=%s skey=%s", dropped, skey)
+                await self._save_ctx_map()
 
-        ctx_id = self._ctx_map.get(skey)
-        if not ctx_id:
-            ctx_id = await self._context_create(model_name, system_prompt or "")
-            self._ctx_map[skey] = ctx_id
-            await self._save_ctx_map()
-            logger.info("[ArkProvider] create ctx=%s skey=%s", ctx_id, skey)
-        return ctx_id
+            ctx_id = self._ctx_map.get(skey)
+            if not ctx_id:
+                ctx_id = await self._context_create(model_name, system_prompt or "")
+                self._ctx_map[skey] = ctx_id
+                await self._save_ctx_map()
+                logger.info("[ArkProvider] create ctx=%s skey=%s", ctx_id, skey)
+            return ctx_id
 
-    # ===== 私有辅助：聊天并按需重试 =====
+    # ===== 聊天并按需重试 =====
     async def _perform_chat_with_retry(
         self, model_name: str, ctx_id: str, prompt: str, system_prompt: str, skey: str
     ) -> Tuple[str, dict, str]:
+        """
+        调用 Ark 接口进行对话；若因 context 失效/过期导致失败，则自动重建一次并重试。
+        """
         try:
             content, usage = await self._context_chat(model_name, ctx_id, prompt)
             return content, usage, ctx_id
@@ -188,9 +248,12 @@ class ArkContextProvider(Provider):
                 return content, usage, new_ctx
             raise
 
-    # ===== 私有辅助：解析 cached_tokens =====
+    # ===== 解析 cached_tokens =====
     @staticmethod
     def _parse_cached_tokens(usage: dict) -> int:
+        """
+        从 usage.prompt_tokens_details.cached_tokens 解析缓存命中数；异常时返回 0。
+        """
         ptd = usage.get("prompt_tokens_details")
         if isinstance(ptd, dict):
             try:
@@ -199,8 +262,11 @@ class ArkContextProvider(Provider):
                 logger.warning("[ArkProvider] cached_tokens parse error: %r", ptd.get("cached_tokens", None))
         return 0
 
-    # ===== 私有辅助：构建 LLMResponse（含 cached_tokens 解析）=====
+    # ===== 构建 LLMResponse =====
     def _build_llm_response(self, text: str, usage: dict, ctx_id: str) -> LLMResponse:
+        """
+        将模型输出与 usage 组装为 LLMResponse；对 total_tokens 做健壮处理，并在 extra 中包含缓存命中数与 context_id。
+        """
         resp = LLMResponse(role="assistant", completion_text=str(text))
 
         # usage 回填（更健壮的 total_tokens）
@@ -242,6 +308,9 @@ class ArkContextProvider(Provider):
         model: str | None = None,
         **kwargs,
     ) -> LLMResponse:
+        """
+        AstrBot 调用的主入口：按需懒加载上下文映射，获取/创建 context，调用 Ark API 并返回 LLMResponse。
+        """
         await self._ensure_ctx_loaded()
 
         model_name = (model or self.get_model() or self._model_default).strip()
@@ -258,7 +327,7 @@ class ArkContextProvider(Provider):
         )
         text = str(content)
 
-        # 组装响应（同时在其中解析 cached_tokens）
+        # 组装响应（在其中解析 cached_tokens）
         resp = self._build_llm_response(text, usage, ctx_id)
 
         # usage 概览日志（直接用 resp.extra 的 cached_tokens，避免重复代码）
@@ -273,6 +342,7 @@ class ArkContextProvider(Provider):
         return resp
 
     async def close(self):
+        """关闭 HTTP 会话（由上层生命周期在合适时机调用）。"""
         try:
             if self._session and not self._session.closed:
                 await self._session.close()
