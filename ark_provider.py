@@ -10,13 +10,7 @@ from astrbot.api import logger  # 规范的日志导入
 from astrbot.api.star import StarTools  # 用统一数据目录
 from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
-
-# 兼容新旧路径：先用正确模块，失败才回退到历史别名
-try:
-    from astrbot.core.provider.entities import LLMResponse, ProviderType
-except ImportError:  # 仅当模块不存在时回退
-    # 历史兼容别名，仓库中存在：astrbot/core/provider/entites.py（内部转发至 entities）
-    from astrbot.core.provider.entites import LLMResponse, ProviderType  # type: ignore
+from astrbot.core.provider.entities import LLMResponse, ProviderType  # 仅使用标准模块名
 
 @register_provider_adapter(
     "ark_context",
@@ -24,6 +18,13 @@ except ImportError:  # 仅当模块不存在时回退
     provider_type=ProviderType.CHAT_COMPLETION,
 )
 class ArkContextProvider(Provider):
+    """
+    非流式 Provider（极简稳定）：
+    - 首轮 /context/create 写入 system prompt，后续复用 context_id
+    - 返回 LLMResponse(role='assistant', completion_text=...)，由 AstrBot 发送
+    - raw_completion.usage 回填（token 统计插件读取）
+    """
+
     def __init__(self, provider_config: dict, provider_settings: dict, default_persona=None):
         super().__init__(provider_config, provider_settings, default_persona)
 
@@ -180,12 +181,15 @@ class ArkContextProvider(Provider):
 
         resp = LLMResponse(role="assistant", completion_text=text)
 
-        # usage 回填（SimpleNamespace）
+        # usage 回填（拆分写法更直观）
         raw = SimpleNamespace()
         raw.usage = SimpleNamespace()
-        raw.usage.prompt_tokens = int(usage.get("prompt_tokens", 0))
-        raw.usage.completion_tokens = int(usage.get("completion_tokens", 0))
-        raw.usage.total_tokens = int(usage.get("total_tokens", raw.usage.prompt_tokens + raw.usage.completion_tokens))
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+        total_tokens = usage.get("total_tokens")
+        raw.usage.prompt_tokens = prompt_tokens
+        raw.usage.completion_tokens = completion_tokens
+        raw.usage.total_tokens = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
         resp.raw_completion = raw
 
         # 透传更多细节（含缓存命中数）
@@ -193,13 +197,6 @@ class ArkContextProvider(Provider):
             resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
         except AttributeError as e:
             logger.warning("[ArkProvider] 设置响应 extra 属性时出错: %s", e)
-
-        # 兼容字段
-        for attr in ("text", "answer", "plain_text", "content", "message"):
-            try:
-                setattr(resp, attr, text)
-            except AttributeError as e:
-                logger.warning("[ArkProvider] 设置响应 %s 属性时出错: %s", attr, e)
 
         return resp
 
