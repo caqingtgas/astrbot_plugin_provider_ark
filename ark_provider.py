@@ -1,7 +1,9 @@
+# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/ark_provider.py
 import asyncio
 import aiohttp
 import json
-from typing import List, Dict, Tuple, Optional, Any
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
 from types import SimpleNamespace
 
 from astrbot.api import logger
@@ -10,233 +12,273 @@ from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 
-ARK_BASE_DEFAULT = "https://ark.cn-beijing.volces.com/api/v3"
 
 @register_provider_adapter(
-    "ark_context",  # ← 与配置一致，确保能被加载
-    "Volcengine Ark (OpenAI-Compatible Chat Completions)",
+    "ark_context",
+    "Volcengine Ark (Context API)",
     provider_type=ProviderType.CHAT_COMPLETION,
 )
 class ArkContextProvider(Provider):
     """
-    Ark Chat Completions（OpenAI 兼容）Provider：
-    - 使用 /chat/completions（非 context 版），可传入 tools 与 role="tool" 消息
-    - func_tool -> tools；tool_calls_result -> role="tool" messages
-    - 把返回的 tool_calls 写回 LLMResponse，驱动 AstrBot 的 ToolLoopAgent
+    非流式 Provider（极简稳定）：
+    - 首轮 /context/create 写入 system prompt，后续复用 context_id
+    - 返回 LLMResponse(role='assistant', completion_text=...)，由 AstrBot 发送
+    - raw_completion.usage 回填（token 统计插件读取）
     """
 
     def __init__(self, provider_config: dict, provider_settings: dict, default_persona=None):
+        """
+        初始化 Provider。
+
+        Args:
+            provider_config: AstrBot 中为该 Provider 配置的字典（key、api_base、ttl、timeout、persist_ctx 等）。
+            provider_settings: 由框架注入的运行时设置。
+            default_persona: 默认人格（未使用）。
+        """
         super().__init__(provider_config, provider_settings, default_persona)
+
+        # ---- 基础配置 ----
         self._keys: List[str] = [(k or "").strip() for k in provider_config.get("key", []) if (k or "").strip()]
         self._key_idx: int = 0
-        self._base: str = (provider_config.get("api_base") or ARK_BASE_DEFAULT).strip().rstrip("/")
+        self._base: str = (provider_config.get("api_base") or "https://ark.cn-beijing.volces.com/api/v3").strip().rstrip("/")
         self._model_default: str = (provider_config.get("model") or provider_config.get("model_config", {}).get("model") or "").strip()
-        self._timeout: int = int(provider_config.get("timeout", 60))
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._ttl: int = int(provider_config.get("ttl", 86400))
+        self._timeout: int = int(provider_config.get("timeout", 60))  # 可配置
 
-        # 仅用于需要的本地数据目录（不做 context 映射）
-        StarTools.get_data_dir("astrbot_plugin_provider_ark")  # 确保目录存在即可
+        # ---- 状态 ----
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._ctx_map: Dict[str, str] = {}  # AstrBot session_id -> Ark context_id
+
+        # ---- 持久化（默认开启） ----
+        self._persist_ctx: bool = bool(provider_config.get("persist_ctx", True))
+        data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark")
+        self._ctx_file: Path = Path(data_dir) / "ctx_map.json"
+        self._ctx_lock = asyncio.Lock()          # I/O 与懒加载互斥
+        self._ctx_loaded: bool = False           # 懒加载标记（不在 __init__ 里读盘）
+
+        # ---- 逐键互斥锁（为 skey 的 context 创建提供互斥，解决并发竞态）----
+        self._ctx_locks: Dict[str, asyncio.Lock] = {}
+        self._ctx_locks_lock = asyncio.Lock()    # 保护 _ctx_locks 字典自身
 
         masked = (self._keys[0][:6] + "..." + self._keys[0][-4:]) if self._keys else "EMPTY"
-        logger.info("[ArkProvider] init base=%s, model=%s, key=%s, timeout=%s",
-                    self._base, self._model_default, masked, self._timeout)
+        logger.info(
+            "[ArkProvider] init base=%s, model=%s, key=%s, persist_ctx=%s, ctx_path=%s, timeout=%s",
+            self._base, self._model_default, masked, self._persist_ctx, self._ctx_file, self._timeout
+        )
 
-    # -------- 基础能力 --------
+    # ===== Provider 基础能力 =====
     def get_models(self) -> List[str]:
+        """
+        返回可用模型列表（来自 provider_config.models 或默认单模型）。
+        """
         models = self.provider_config.get("models")
         return models if isinstance(models, list) and models else ([self._model_default] if self._model_default else [])
 
     def get_current_key(self) -> str:
+        """
+        获取当前使用的 API Key（支持多 Key 轮换选择）。
+        """
         return self._keys[self._key_idx] if self._keys else ""
 
     def set_key(self, key: str):
+        """
+        设置当前使用的 API Key。
+        """
         k = (key or "").strip()
         if k in self._keys:
             self._key_idx = self._keys.index(k)
 
-    # -------- HTTP --------
+    # ===== Ark HTTP =====
     async def _sess(self) -> aiohttp.ClientSession:
+        """
+        获取（或创建）共享的 aiohttp.ClientSession，会使用可配置的总超时。
+        """
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout))
         return self._session
 
     def _headers(self) -> dict:
+        """构造 Ark API 所需请求头。"""
         return {"Authorization": f"Bearer {self.get_current_key().strip()}", "Content-Type": "application/json"}
 
-    # -------- 工具与消息构造 --------
-    @staticmethod
-    def _tools_from_manager(func_tool: Any) -> List[dict]:
+    async def _context_create(self, model: str, system_prompt: str) -> str:
         """
-        从 AstrBot 的 func_tool 管理器提取 OpenAI 兼容 tools：
-        优先使用管理器的导出方法；失败则兜底从内部工具列表提取（不抛错）。
+        创建 Ark 对话上下文（Context）。
         """
-        tools: List[dict] = []
-        if not func_tool:
-            return tools
-
-        # 优先：常见导出方法
-        for attr in ("to_openai_tools", "to_tools", "export_openai_tools"):
-            if hasattr(func_tool, attr):
-                try:
-                    res = getattr(func_tool, attr)()
-                    if isinstance(res, list) and res:
-                        return res
-                except Exception as e:
-                    logger.debug("[ArkProvider] func_tool.%s() failed: %s", attr, e)
-
-        # 兜底：读取内部工具集合
-        try:
-            iterable = None
-            if hasattr(func_tool, "tools"):
-                iterable = getattr(func_tool, "tools")
-            elif hasattr(func_tool, "get_tools"):
-                iterable = getattr(func_tool, "get_tools")()
-            if iterable:
-                for t in iterable:
-                    name = getattr(t, "name", None)
-                    params = getattr(t, "parameters", None)
-                    desc = getattr(t, "description", "") or ""
-                    active = getattr(t, "active", True)
-                    if name and isinstance(params, dict) and active:
-                        tools.append({"type": "function", "function": {"name": name, "description": desc, "parameters": params}})
-        except Exception as e:
-            logger.debug("[ArkProvider] fallback build tools failed: %s", e)
-        return tools
-
-    @staticmethod
-    def _append_tool_results(messages: List[dict], tool_calls_result: Any) -> None:
-        """
-        将 AstrBot 的工具执行结果转为 role="tool" 消息，追加到 messages。
-        兼容：对象（有 to_openai_messages 方法）/ 字典 / 列表。
-        """
-        if not tool_calls_result:
-            return
-        # 1) 优先走标准导出
-        items = tool_calls_result if isinstance(tool_calls_result, (list, tuple)) else [tool_calls_result]
-        appended = 0
-        for r in items:
-            if hasattr(r, "to_openai_messages"):
-                try:
-                    msgs = r.to_openai_messages()
-                    if isinstance(msgs, list):
-                        messages.extend(msgs); appended += len(msgs)
-                    continue
-                except Exception:
-                    pass
-            # 2) 容错：按常见字段拼
-            try:
-                rc = r if isinstance(r, dict) else getattr(r, "__dict__", {}) or {}
-                tool_call_id = rc.get("tool_call_id") or rc.get("id") or rc.get("call_id")
-                name = rc.get("name")
-                content = rc.get("result", None) or rc.get("content", None) or rc.get("output", "")
-                msg = {"role": "tool", "content": str(content or "")}
-                if tool_call_id: msg["tool_call_id"] = str(tool_call_id)
-                if name: msg["name"] = str(name)
-                messages.append(msg); appended += 1
-            except Exception:
-                continue
-        if appended:
-            logger.info("[ArkProvider] appended tool result messages: %d", appended)
-
-    @staticmethod
-    def _normalize_contexts(contexts: Optional[List[dict]]) -> List[dict]:
-        """
-        将 AstrBot 传入的 contexts 原样透传（已是 OpenAI 兼容结构）。
-        """
-        if not contexts: return []
-        out = []
-        for m in contexts:
-            if isinstance(m, dict) and "role" in m:
-                out.append(m)
-        return out
-
-    @staticmethod
-    def _mk_user_message(prompt: str, image_urls: Optional[List[str]]) -> dict:
-        if image_urls:
-            parts = [{"type": "text", "text": str(prompt)}] if (prompt or "").strip() else []
-            for url in image_urls:
-                if url: parts.append({"type": "image_url", "image_url": {"url": str(url)}})
-            return {"role": "user", "content": parts}
-        return {"role": "user", "content": str(prompt)}
-
-    def _build_messages(
-        self,
-        prompt: str,
-        contexts: Optional[List[dict]],
-        image_urls: Optional[List[str]],
-        system_prompt: Optional[str],
-        tool_calls_result: Any,
-    ) -> List[dict]:
-        """
-        组装 messages：
-        - 若存在 tool_calls_result：这是“工具回传后的续问”，只追加 role="tool" 结果，不再新建本轮 user 消息；
-        - 否则：按常规追加本轮 user 消息（可含图片）。
-        """
-        messages: List[dict] = []
-        if (system_prompt or "").strip():
-            messages.append({"role": "system", "content": str(system_prompt)})
-        messages.extend(self._normalize_contexts(contexts))
-        if tool_calls_result:
-            self._append_tool_results(messages, tool_calls_result)
-        else:
-            messages.append(self._mk_user_message(prompt, image_urls))
-        return messages
-
-    # -------- Ark Chat Completions --------
-    async def _chat_completions(self, model: str, messages: List[dict], tools: List[dict]) -> Tuple[dict, dict]:
-        url = f"{self._base}/chat/completions"
-        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        url = f"{self._base}/context/create"
+        payload = {
+            "model": model,
+            "mode": "session",
+            "ttl": self._ttl,
+            "messages": [{"role": "system", "content": (system_prompt or "").strip()}],
+        }
         async with (await self._sess()).post(url, json=payload, headers=self._headers()) as resp:
             data = await (resp.json() if resp.content_type == "application/json" else resp.text())
-            if not isinstance(data, dict) or resp.status >= 400:
-                raise RuntimeError(f"Ark chat_completions failed: {data}")
-            chs = data.get("choices") or []
-            if not chs:
-                raise RuntimeError(f"Ark chat_completions empty choices: {data}")
-            msg = (chs[0].get("message") or {})
-            usage = data.get("usage") or {}
-            return msg, usage
+            if isinstance(data, dict) and "id" in data and resp.status < 400:
+                ctx_id = data["id"]
+                logger.info("[ArkProvider] context created: %s", ctx_id)
+                return ctx_id
+            raise RuntimeError(f"Ark context_create failed: {data}")
 
-    @staticmethod
-    def _extract_tool_calls(msg: dict) -> Tuple[List[dict], Optional[dict]]:
+    async def _context_chat(self, model: str, ctx_id: str, user_text: str) -> Tuple[str, dict]:
         """
-        兼容：message.tool_calls（新）与 message.function_call（旧）。
-        返回 (tool_calls, function_call_legacy)
+        使用既有 context 进行一次非流式对话请求。
         """
-        tool_calls = msg.get("tool_calls") or []
-        fn_legacy = msg.get("function_call")
-        norm: List[dict] = []
-        for c in tool_calls:
-            fn = (c or {}).get("function") or {}
-            name, arguments = fn.get("name"), fn.get("arguments")
-            if name and arguments is not None:
-                norm.append({
-                    "id": c.get("id") or "",
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments},
-                })
-        return norm, fn_legacy
+        url = f"{self._base}/context/chat/completions"
+        payload = {
+            "model": model,
+            "context_id": ctx_id,
+            "messages": [{"role": "user", "content": str(user_text)}],
+            "stream": False,
+        }
+        async with (await self._sess()).post(url, json=payload, headers=self._headers()) as resp:
+            data = await (resp.json() if resp.content_type == "application/json" else resp.text())
+            if isinstance(data, dict) and resp.status < 400:
+                content = data["choices"][0]["message"]["content"]
+                usage = data.get("usage", {}) or {}
+                logger.info("[ArkProvider] chat ok ctx=%s len=%d", ctx_id, len(content))
+                return content, usage
+            raise RuntimeError(f"Ark context_chat failed: {data}")
 
-    # -------- usage / extra 填充 --------
+    # ===== 懒加载：读取 ctx_map（加锁 + 二次检查）=====
+    async def _ensure_ctx_loaded(self):
+        """
+        懒加载上下文映射表：在首次使用前从磁盘加载到内存。
+        加锁并二次检查，避免并发重复加载；I/O 在线程池中执行，避免阻塞事件循环。
+        """
+        if self._ctx_loaded or not self._persist_ctx:
+            return
+        async with self._ctx_lock:
+            if self._ctx_loaded:  # 二次检查
+                return
+            p = self._ctx_file
+
+            def _read_sync() -> Dict[str, str]:
+                if not p.exists():
+                    return {}
+                data = json.loads(p.read_text(encoding="utf-8"))
+                m = data.get("map", {})
+                return {str(k): str(v) for k, v in m.items()} if isinstance(m, dict) else {}
+
+            try:
+                self._ctx_map = await asyncio.to_thread(_read_sync)
+                if self._ctx_map:
+                    logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("[ArkProvider] failed to load ctx_map from %s: %s", p, e)
+            finally:
+                self._ctx_loaded = True
+
+    # ===== 保存 ctx_map（互斥 + 原子写 + 异步线程）=====
+    async def _save_ctx_map(self):
+        """
+        将内存中的上下文映射表保存到磁盘。
+        使用互斥锁与原子替换，I/O 在线程池执行。
+        """
+        if not self._persist_ctx:
+            return
+        p = self._ctx_file
+
+        def _write_sync():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"map": self._ctx_map}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+
+        async with self._ctx_lock:
+            try:
+                await asyncio.to_thread(_write_sync)
+            except (OSError, PermissionError) as e:
+                logger.warning("[ArkProvider] failed to save ctx_map to %s: %s", p, e)
+
+    # ===== 逐键互斥：获取某个 skey 的锁 =====
+    async def _get_key_lock(self, skey: str) -> asyncio.Lock:
+        """
+        返回该 skey 对应的互斥锁；必要时在受保护字典内创建。
+        """
+        async with self._ctx_locks_lock:
+            lock = self._ctx_locks.get(skey)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._ctx_locks[skey] = lock
+            return lock
+
+    # ===== 获取或创建 context（逐键加锁，避免并发竞态）=====
+    async def _get_or_create_context(
+        self, skey: str, model_name: str, system_prompt: str, contexts: Optional[List[dict]]
+    ) -> str:
+        """
+        获取（或在必要时创建）给定 skey 的 Ark context。
+        将“检查是否存在 + 创建 + 写入映射”作为一个临界区，在 per-skey 互斥锁下执行，避免并发重复创建。
+        """
+        key_lock = await self._get_key_lock(skey)
+        async with key_lock:
+            # /reset 配合：AstrBot 清空历史后（contexts 为空），丢弃旧 ctx 强制重建
+            if not contexts and skey in self._ctx_map:
+                dropped = self._ctx_map.pop(skey, None)
+                logger.info("[ArkProvider] reset detected -> drop ctx=%s skey=%s", dropped, skey)
+                await self._save_ctx_map()
+
+            ctx_id = self._ctx_map.get(skey)
+            if not ctx_id:
+                ctx_id = await self._context_create(model_name, system_prompt or "")
+                self._ctx_map[skey] = ctx_id
+                await self._save_ctx_map()
+                logger.info("[ArkProvider] create ctx=%s skey=%s", ctx_id, skey)
+            return ctx_id
+
+    # ===== 聊天并按需重试 =====
+    async def _perform_chat_with_retry(
+        self, model_name: str, ctx_id: str, prompt: str, system_prompt: str, skey: str
+    ) -> Tuple[str, dict, str]:
+        """
+        调用 Ark 接口进行对话；若因 context 失效/过期导致失败，则自动重建一次并重试。
+        """
+        try:
+            content, usage = await self._context_chat(model_name, ctx_id, prompt)
+            return content, usage, ctx_id
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "context" in msg and any(k in msg for k in ("invalid", "expire", "not found", "does not exist")):
+                logger.warning("[ArkProvider] ctx invalid -> recreate & retry. old=%s skey=%s", ctx_id, skey)
+                new_ctx = await self._context_create(model_name, system_prompt or "")
+                self._ctx_map[skey] = new_ctx
+                await self._save_ctx_map()
+                content, usage = await self._context_chat(model_name, new_ctx, prompt)
+                return content, usage, new_ctx
+            raise
+
+    # ===== 解析 cached_tokens =====
     @staticmethod
     def _parse_cached_tokens(usage: dict) -> int:
+        """
+        从 usage.prompt_tokens_details.cached_tokens 解析缓存命中数；异常时返回 0。
+        """
         ptd = usage.get("prompt_tokens_details")
         if isinstance(ptd, dict):
-            try: return int(ptd.get("cached_tokens", 0))
-            except Exception: return 0
+            try:
+                return int(ptd.get("cached_tokens", 0))
+            except (TypeError, ValueError):
+                logger.warning("[ArkProvider] cached_tokens parse error: %r", ptd.get("cached_tokens", None))
         return 0
 
-    def _fill_usage_and_extra(self, resp: LLMResponse, usage: dict):
+    # ===== 构建 LLMResponse =====
+    def _build_llm_response(self, text: str, usage: dict, ctx_id: str) -> LLMResponse:
+        """
+        将模型输出与 usage 组装为 LLMResponse；对 total_tokens 做健壮处理，并在 extra 中包含缓存命中数与 context_id。
+        """
+        resp = LLMResponse(role="assistant", completion_text=str(text))
+
+        # usage 回填（更健壮的 total_tokens）
         prompt_tokens = int(usage.get("prompt_tokens", 0))
         completion_tokens = int(usage.get("completion_tokens", 0))
         total_tokens = usage.get("total_tokens")
         try:
             total = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
-        except Exception:
+        except (ValueError, TypeError):
+            logger.warning("[ArkProvider] 无法将 total_tokens ('%s') 转为整数，回退为计算值", total_tokens)
             total = prompt_tokens + completion_tokens
+
         raw = SimpleNamespace()
         raw.usage = SimpleNamespace()
         raw.usage.prompt_tokens = prompt_tokens
@@ -244,16 +286,35 @@ class ArkContextProvider(Provider):
         raw.usage.total_tokens = total
         resp.raw_completion = raw
 
-        cached = self._parse_cached_tokens(usage)
-        extra = getattr(resp, "extra", {}) or {}
-        extra.update({"ark_usage": usage, "ark_cached_tokens": cached})
+        # extra（含缓存命中）
+        cached_tokens = self._parse_cached_tokens(usage)
         try:
-            resp.extra = extra
-        except Exception:
-            # 若 LLMResponse 限制属性，则忽略（不影响 ToolLoop）
-            pass
+            resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
+        except AttributeError as e:
+            logger.warning("[ArkProvider] 设置响应 extra 属性时出错: %s", e)
+        extra_payload = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
 
-    # -------- AstrBot Provider 入口 --------
+        # 避免用异常做流程控制：先判断对象是否具有可写属性
+        can_set = False
+        if getattr(resp, "__dict__", None) is not None:
+            can_set = True
+        else:
+            slots = getattr(type(resp), "__slots__", ())
+            if isinstance(slots, (list, tuple, set)) and "extra" in slots:
+                can_set = True
+
+        if can_set:
+            resp.extra = extra_payload
+        else:
+            rc = getattr(resp, "raw_completion", None)
+            if rc is not None and getattr(rc, "__dict__", None) is not None:
+                rc.extra = extra_payload
+            else:
+                logger.info("[ArkProvider] 当前 LLMResponse 不支持附加 extra 字段，已跳过透传（ctx_id=%s）", ctx_id)
+
+        return resp
+
+    # ===== AstrBot Provider 入口 =====
     async def text_chat(
         self,
         prompt: str,
@@ -262,71 +323,47 @@ class ArkContextProvider(Provider):
         func_tool=None,
         contexts: List[dict] = None,
         system_prompt: str = None,
-        tool_calls_result: Any = None,
+        tool_calls_result=None,
         model: str | None = None,
         **kwargs,
     ) -> LLMResponse:
         """
-        把 contexts / func_tool / tool_calls_result 映射为 OpenAI 兼容的 messages / tools，
-        调用 Ark Chat Completions，返回带 tool_calls 的 LLMResponse。
+        AstrBot 调用的主入口：按需懒加载上下文映射，获取/创建 context，调用 Ark API 并返回 LLMResponse。
         """
+        await self._ensure_ctx_loaded()
+
         model_name = (model or self.get_model() or self._model_default).strip()
         if not model_name:
-            raise RuntimeError("ArkProvider: model not configured")
+            raise RuntimeError("ArkProvider: model not configured (use ep-... endpoint id)")
         if not self.get_current_key():
             raise RuntimeError("ArkProvider: API Key not configured")
 
-        messages = self._build_messages(
-            prompt=prompt,
-            contexts=contexts,
-            image_urls=image_urls,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
+        skey = (session_id or "global").strip()
+        ctx_id = await self._get_or_create_context(skey, model_name, system_prompt or "", contexts)
+
+        content, usage, ctx_id = await self._perform_chat_with_retry(
+            model_name, ctx_id, prompt, system_prompt or "", skey
         )
+        text = str(content)
 
-        tools = self._tools_from_manager(func_tool)
-        logger.info("[ArkProvider] tools enabled=%s tools_num=%d",
-                    bool(tools), len(tools))
+        # 组装响应（在其中解析 cached_tokens）
+        resp = self._build_llm_response(text, usage, ctx_id)
 
-        assistant_message, usage = await self._chat_completions(model_name, messages, tools)
-        tool_calls, fn_legacy = self._extract_tool_calls(assistant_message)
-
-        text = assistant_message.get("content") or ""
-        resp = LLMResponse(role="assistant", completion_text=str(text))
-
-        # 回填 usage / extra
-        if usage: self._fill_usage_and_extra(resp, usage)
-
-        # 写回工具调用结果（标准字段 + extra 兜底）
-        if tool_calls:
-            try:
-                resp.tool_calls = tool_calls  # AstrBot ToolLoopAgent 会读取
-            except Exception:
-                extra = getattr(resp, "extra", {}) or {}
-                extra["__tool_calls__"] = tool_calls
-                try: resp.extra = extra
-                except Exception: pass
-
-        if fn_legacy and not tool_calls:
-            try:
-                resp.function_call = fn_legacy
-            except Exception:
-                pass
-
-        logger.info("[ArkProvider] chat ok has_tool_calls=%s tool_calls_n=%d",
-                    bool(tool_calls or fn_legacy), len(tool_calls))
-        logger.info("[ArkProvider] usage: prompt=%s completion=%s total=%s cached_tokens=%s tool_calls=%s",
-                    (usage or {}).get("prompt_tokens", 0),
-                    (usage or {}).get("completion_tokens", 0),
-                    (usage or {}).get("total_tokens", 0),
-                    (getattr(resp, "extra", {}) or {}).get("ark_cached_tokens", 0),
-                    len(tool_calls))
-
+        # usage 概览日志（直接用 resp.extra 的 cached_tokens，避免重复代码）
+        cached_tokens = (getattr(resp, "extra", {}) or {}).get("ark_cached_tokens", 0)
+        logger.info(
+            "[ArkProvider] usage: prompt=%s completion=%s total=%s cached_tokens=%s",
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("total_tokens", 0),
+            cached_tokens,
+        )
         return resp
 
     async def close(self):
+        """关闭 HTTP 会话（由上层生命周期在合适时机调用）。"""
         try:
             if self._session and not self._session.closed:
                 await self._session.close()
         except Exception as e:
-            logger.warning("[ArkProvider] close session error: %s", e)
+            logger.warning("[ArkProvider] 关闭 HTTP 会话时出错: %s", e)
