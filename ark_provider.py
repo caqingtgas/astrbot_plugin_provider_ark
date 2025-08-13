@@ -39,7 +39,6 @@ class ArkContextProvider(Provider):
 
         # ---- 状态 ----
         self._session: Optional[aiohttp.ClientSession] = None
-        self._last_usage: Dict[str, dict] = {}
         self._ctx_map: Dict[str, str] = {}  # AstrBot session_id -> Ark context_id
 
         # ---- 持久化（默认开启） ----
@@ -110,28 +109,30 @@ class ArkContextProvider(Provider):
                 return content, usage
             raise RuntimeError(f"Ark context_chat failed: {data}")
 
-    # ===== 私有辅助：懒加载 ctx_map =====
+    # ===== 私有辅助：懒加载 ctx_map（加锁 + 二次检查）=====
     async def _ensure_ctx_loaded(self):
         if self._ctx_loaded or not self._persist_ctx:
-            self._ctx_loaded = True
             return
-        p = self._ctx_file
+        async with self._ctx_lock:
+            if self._ctx_loaded:  # 二次检查，避免并发重复加载
+                return
+            p = self._ctx_file
 
-        def _read_sync() -> Dict[str, str]:
-            if not p.exists():
-                return {}
-            data = json.loads(p.read_text(encoding="utf-8"))
-            m = data.get("map", {})
-            return {str(k): str(v) for k, v in m.items()} if isinstance(m, dict) else {}
+            def _read_sync() -> Dict[str, str]:
+                if not p.exists():
+                    return {}
+                data = json.loads(p.read_text(encoding="utf-8"))
+                m = data.get("map", {})
+                return {str(k): str(v) for k, v in m.items()} if isinstance(m, dict) else {}
 
-        try:
-            self._ctx_map = await asyncio.to_thread(_read_sync)
-            if self._ctx_map:
-                logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("[ArkProvider] failed to load ctx_map from %s: %s", p, e)
-        finally:
-            self._ctx_loaded = True
+            try:
+                self._ctx_map = await asyncio.to_thread(_read_sync)
+                if self._ctx_map:
+                    logger.info("[ArkProvider] loaded %d ctx bindings from %s", len(self._ctx_map), p)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("[ArkProvider] failed to load ctx_map from %s: %s", p, e)
+            finally:
+                self._ctx_loaded = True
 
     # ===== 私有辅助：保存 ctx_map（互斥 + 原子写 + 异步线程）=====
     async def _save_ctx_map(self):
@@ -187,7 +188,18 @@ class ArkContextProvider(Provider):
                 return content, usage, new_ctx
             raise
 
-    # ===== 私有辅助：构建 LLMResponse =====
+    # ===== 私有辅助：解析 cached_tokens =====
+    @staticmethod
+    def _parse_cached_tokens(usage: dict) -> int:
+        ptd = usage.get("prompt_tokens_details")
+        if isinstance(ptd, dict):
+            try:
+                return int(ptd.get("cached_tokens", 0))
+            except (TypeError, ValueError):
+                logger.warning("[ArkProvider] cached_tokens parse error: %r", ptd.get("cached_tokens", None))
+        return 0
+
+    # ===== 私有辅助：构建 LLMResponse（含 cached_tokens 解析）=====
     def _build_llm_response(self, text: str, usage: dict, ctx_id: str) -> LLMResponse:
         resp = LLMResponse(role="assistant", completion_text=str(text))
 
@@ -209,13 +221,7 @@ class ArkContextProvider(Provider):
         resp.raw_completion = raw
 
         # extra（含缓存命中）
-        cached_tokens = 0
-        ptd = usage.get("prompt_tokens_details")
-        if isinstance(ptd, dict):
-            try:
-                cached_tokens = int(ptd.get("cached_tokens", 0))
-            except (TypeError, ValueError) as e:
-                logger.warning("[ArkProvider] cached_tokens parse error: %s", e)
+        cached_tokens = self._parse_cached_tokens(usage)
         try:
             resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
         except AttributeError as e:
@@ -252,18 +258,11 @@ class ArkContextProvider(Provider):
         )
         text = str(content)
 
-        # 记录最近 usage
-        self._last_usage[skey] = usage
-        self._last_recent: Tuple[str, dict] = (skey, usage)
+        # 组装响应（同时在其中解析 cached_tokens）
+        resp = self._build_llm_response(text, usage, ctx_id)
 
-        # usage 概览日志（含缓存命中）
-        cached_tokens = 0
-        ptd = usage.get("prompt_tokens_details")
-        if isinstance(ptd, dict):
-            try:
-                cached_tokens = int(ptd.get("cached_tokens", 0))
-            except (TypeError, ValueError) as e:
-                logger.warning("[ArkProvider] cached_tokens parse error: %s", e)
+        # usage 概览日志（直接用 resp.extra 的 cached_tokens，避免重复代码）
+        cached_tokens = (getattr(resp, "extra", {}) or {}).get("ark_cached_tokens", 0)
         logger.info(
             "[ArkProvider] usage: prompt=%s completion=%s total=%s cached_tokens=%s",
             usage.get("prompt_tokens", 0),
@@ -271,8 +270,7 @@ class ArkContextProvider(Provider):
             usage.get("total_tokens", 0),
             cached_tokens,
         )
-
-        return self._build_llm_response(text, usage, ctx_id)
+        return resp
 
     async def close(self):
         try:
