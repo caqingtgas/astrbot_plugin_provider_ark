@@ -1,4 +1,4 @@
-# /opt/AstrBot/data/plugins/astrbot_provider_ark/main.py
+# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/main.py
 from astrbot.api.star import Star, Context  # 不再使用 @register
 from astrbot.api import logger
 

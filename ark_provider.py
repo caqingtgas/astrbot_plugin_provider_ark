@@ -1,4 +1,4 @@
-# /opt/AstrBot/data/plugins/astrbot_provider_ark/ark_provider.py
+# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/ark_provider.py
 import aiohttp
 from typing import List, Dict, Tuple, Optional
 from types import SimpleNamespace
