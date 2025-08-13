@@ -1,4 +1,3 @@
-# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/ark_provider.py
 import asyncio
 import aiohttp
 import json
@@ -288,10 +287,25 @@ class ArkContextProvider(Provider):
 
         # extra（含缓存命中）
         cached_tokens = self._parse_cached_tokens(usage)
-        try:
-            resp.extra = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
-        except AttributeError as e:
-            logger.warning("[ArkProvider] 设置响应 extra 属性时出错: %s", e)
+        extra_payload = {"ark_usage": usage, "ark_cached_tokens": cached_tokens, "ark_context_id": ctx_id}
+
+        # 避免用异常做流程控制：先判断对象是否具有可写属性
+        can_set = False
+        if getattr(resp, "__dict__", None) is not None:
+            can_set = True
+        else:
+            slots = getattr(type(resp), "__slots__", ())
+            if isinstance(slots, (list, tuple, set)) and "extra" in slots:
+                can_set = True
+
+        if can_set:
+            resp.extra = extra_payload
+        else:
+            rc = getattr(resp, "raw_completion", None)
+            if rc is not None and getattr(rc, "__dict__", None) is not None:
+                rc.extra = extra_payload
+            else:
+                logger.info("[ArkProvider] 当前 LLMResponse 不支持附加 extra 字段，已跳过透传（ctx_id=%s）", ctx_id)
 
         return resp
 
