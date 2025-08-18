@@ -1,6 +1,6 @@
 # Ark Context Provider for AstrBot
 
-**在 AstrBot 使用火山方舟(Volcengine Ark)上下文缓存API**
+**在 AstrBot 使用火山方舟(Volcengine Ark)上下文缓存API(Context API)**
 
 ## 简介
 ChatGPT5.0全新力作，之前用GPT4.5和Gemini2.5Pro都没能解决。

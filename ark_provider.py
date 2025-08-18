@@ -1,4 +1,4 @@
-# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark/ark_provider.py
+# /opt/AstrBot/data/plugins/astrbot_plugin_provider_ark_ContextAPI/ark_provider.py
 import asyncio
 import aiohttp
 import json
@@ -51,7 +51,7 @@ class ArkContextProvider(Provider):
 
         # ---- 持久化（默认开启） ----
         self._persist_ctx: bool = bool(provider_config.get("persist_ctx", True))
-        data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark")
+        data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark_ContextAPI")
         self._ctx_file: Path = Path(data_dir) / "ctx_map.json"
         self._ctx_lock = asyncio.Lock()          # I/O 与懒加载互斥
         self._ctx_loaded: bool = False           # 懒加载标记（不在 __init__ 里读盘）
